@@ -243,7 +243,51 @@ class ServerState:
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
+        # ── Auto-augment text_prompt with live tool data ──────────────────────
+        # This runs server-side on every WebSocket connection so it works with
+        # the existing NVIDIA prebuilt web UI (dist.tgz) without any client
+        # changes.  Two augmentation paths:
+        #
+        #  1. Specific topic detected (bitcoin, gold, tesla, latest news, …):
+        #     → call the relevant tools (crypto / finance / search) and inject
+        #       targeted results into the system prompt.
+        #
+        #  2. General real-time signal detected ("real-time voice assistant",
+        #     "live information", "up-to-date", …) but no specific topic:
+        #     → proactive snapshot: fetch top crypto prices + commodities +
+        #       stock indices + key forex rates so the model can answer ANY
+        #       live data question the user asks during the conversation.
+        #
+        # If no tool-related signal is found the prompt passes through unchanged.
+        text_prompt_raw: str = request.query.get("text_prompt", "").strip()
+
+        if text_prompt_raw and self.tool_manager:
+            _detected = self.tool_manager.detect_tools(text_prompt_raw)
+
+            if _detected == ["__proactive__"]:
+                # General real-time assistant — fetch comprehensive snapshot
+                clog.log("info", "proactive live data fetch triggered by text_prompt")
+                text_prompt_raw, _results = await self.tool_manager.proactive_augment_async(
+                    text_prompt_raw
+                )
+                if _results:
+                    _used = [r.tool_name for r in _results if r.success]
+                    clog.log("info", f"proactive augmentation done — tools: {_used}")
+
+            elif _detected:
+                # Specific topics detected — targeted tool fetch
+                clog.log("info", f"targeted tool fetch: {_detected} (from text_prompt)")
+                text_prompt_raw, _results = await self.tool_manager.augment_prompt_async(
+                    text_prompt_raw, text_prompt_raw
+                )
+                if _results:
+                    _used = [r.tool_name for r in _results if r.success]
+                    clog.log("info", f"targeted augmentation done — tools: {_used}")
+
+        self.lm_gen.text_prompt_tokens = (
+            self.text_tokenizer.encode(wrap_with_system_tags(text_prompt_raw))
+            if text_prompt_raw else None
+        )
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():

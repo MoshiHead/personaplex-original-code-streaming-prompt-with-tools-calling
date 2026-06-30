@@ -172,12 +172,13 @@ def detect_live_intent(query: str) -> tuple[bool, list[str]]:
     if finance_cats & set(matched_categories):
         tool_categories.append("finance")
 
-    # Everything that isn't pure crypto/finance gets search
-    non_search_cats = {"crypto", "finance"}
-    needs_search = bool(set(matched_categories) - non_search_cats) or (
-        has_recency and not tool_categories
-    )
-    if needs_search:
+    # Only add "search" for specific searchable topic categories.
+    # Do NOT add "search" just because a recency keyword ("real-time", "live") was
+    # present without a specific topic — that case is a general "proactive" signal
+    # handled separately by is_proactive_trigger().  Calling the search tool with a
+    # system-prompt string as the query produces useless results.
+    searchable_cats = {"news", "people", "sports", "ai_news", "weather"}
+    if searchable_cats & set(matched_categories):
         tool_categories.append("search")
 
     # Deduplicate preserving order
@@ -188,7 +189,38 @@ def detect_live_intent(query: str) -> tuple[bool, list[str]]:
             unique.append(c)
             seen.add(c)
 
-    return True, unique or ["search"]
+    # If has_recency but no specific topics: signal "proactive" so callers know a
+    # comprehensive data snapshot is appropriate (see is_proactive_trigger below).
+    if not unique and has_recency:
+        return True, ["proactive"]
+
+    return bool(unique), unique
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Proactive trigger detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PROACTIVE_RE = re.compile(
+    r"\b("
+    r"real.?time|live.?(data|information|info|prices?|market|news)"
+    r"|up.?to.?date|current.?information|always.?accurate"
+    r"|latest.?information|fresh.?data|live.?assistant"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_proactive_trigger(text: str) -> bool:
+    """
+    Return True when the text contains a general 'real-time / live data' signal
+    without naming a specific topic — i.e. it reads like a system prompt for a
+    general real-time assistant rather than a user query about a specific subject.
+
+    Used to decide whether to pre-fetch a comprehensive live data snapshot
+    (crypto prices + stock indices + key forex) before the conversation starts.
+    """
+    return bool(_PROACTIVE_RE.search(text))
 
 
 def describe_intent(query: str) -> str:

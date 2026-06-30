@@ -19,7 +19,7 @@ import logging
 from typing import Optional
 
 from .base import BaseTool, ToolResult
-from .intent import detect_live_intent, describe_intent
+from .intent import detect_live_intent, describe_intent, is_proactive_trigger
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +68,22 @@ class ToolManager:
     def detect_tools(self, query: str) -> list[str]:
         """
         Return ordered list of tool names to invoke for this query.
-        Empty list means no live data is needed.
+
+        Returns [] when no live data is needed.
+        Returns ["__proactive__"] as a sentinel when the text contains a general
+        'real-time / live data' signal without naming a specific topic — callers
+        should then invoke proactive_augment_async() instead of augment_prompt_async().
         """
         logger.debug("intent check: %s", describe_intent(query))
         needs_live, categories = detect_live_intent(query)
         if not needs_live:
+            return []
+
+        # "proactive" is a sentinel from intent detection meaning: general real-time
+        # signal present but no specific topic found — handle with proactive fetch
+        if categories == ["proactive"]:
+            if is_proactive_trigger(query):
+                return ["__proactive__"]
             return []
 
         tool_names: list[str] = []
@@ -80,8 +91,11 @@ class ToolManager:
             if cat in self._tools and cat not in tool_names:
                 tool_names.append(cat)
 
-        # Fallback: if intent says "search" but no search tool registered, skip
         return [t for t in tool_names if t in self._tools]
+
+    def is_proactive_trigger(self, text: str) -> bool:
+        """Delegate to intent module."""
+        return is_proactive_trigger(text)
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
@@ -127,6 +141,56 @@ class ToolManager:
             )
         finally:
             loop.close()
+
+    async def proactive_augment_async(
+        self, base_prompt: str
+    ) -> tuple[str, list[ToolResult]]:
+        """
+        Fetch a comprehensive live data snapshot without a specific user query.
+
+        Called when the text_prompt reads like a general real-time assistant
+        (e.g. "You are a real-time AI voice assistant with access to live information")
+        but does not name a specific topic.  Pre-fetches the data the user is most
+        likely to ask about verbally during the conversation:
+          - Top cryptocurrency prices (Bitcoin, Ethereum, Solana, BNB)
+          - Key commodities (Gold, Silver, Crude Oil)
+          - Major stock indices (S&P 500, Nasdaq, Dow Jones)
+          - Key forex rates (EUR/USD, GBP/USD, USD/JPY, USD/BDT, USD/INR)
+
+        This ensures the model can answer live data questions accurately even when
+        the user never typed a specific query before connecting.
+        """
+        tasks = []
+        # Crypto snapshot — top coins by market cap
+        if "crypto" in self._tools:
+            tasks.append(
+                self._tools["crypto"].safe_execute(
+                    "bitcoin ethereum solana binancecoin ripple"
+                )
+            )
+        # Finance snapshot — commodities, indices, and forex
+        if "finance" in self._tools:
+            tasks.append(
+                self._tools["finance"].safe_execute(
+                    "gold silver oil S&P 500 nasdaq dow jones "
+                    "USD to EUR USD to GBP USD to JPY USD to BDT USD to INR"
+                )
+            )
+
+        if not tasks:
+            return base_prompt, []
+
+        logger.info("proactive data snapshot: fetching crypto + finance")
+        raw_results = await asyncio.gather(*tasks)
+        results = [r for r in raw_results if r.success]
+
+        if not results:
+            logger.warning("proactive snapshot: all tools failed")
+            return base_prompt, []
+
+        context = self.build_context_block(results)
+        augmented = _build_augmented_prompt(base_prompt, context)
+        return augmented, results
 
     async def augment_prompt_async(
         self, base_prompt: str, query: str
