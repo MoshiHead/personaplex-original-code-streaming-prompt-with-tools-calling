@@ -38,7 +38,7 @@ const TEXT_PROMPT_PRESETS = [
   },
 ];
 
-const TEXT_PROMPT_MAX_LEN = 4000;
+const TEXT_PROMPT_MAX_LEN = 6000;
 
 interface HomepageProps {
   showMicrophoneAccessMessage: boolean;

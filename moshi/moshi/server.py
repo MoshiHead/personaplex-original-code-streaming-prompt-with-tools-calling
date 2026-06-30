@@ -49,6 +49,7 @@ from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .tools import ToolManager, SearchTool, CryptoTool, FinanceTool
 
 
 logger = setup_logger(__name__)
@@ -96,7 +97,8 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 tool_manager: Optional[ToolManager] = None):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -110,7 +112,7 @@ class ServerState:
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
         )
-        
+        self.tool_manager = tool_manager
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
@@ -131,6 +133,80 @@ class ServerState:
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
 
+    async def handle_augment_prompt(self, request):
+        """
+        POST /api/augment-prompt
+        JSON body: {"query": "...", "base_prompt": "..."}
+        JSON response: {"augmented_prompt": "...", "tools_used": [...],
+                        "context": "...", "needs_tools": bool}
+
+        The client should call this endpoint before opening the WebSocket
+        and pass the returned augmented_prompt as the text_prompt query
+        parameter.  This is the only integration point that does not affect
+        the real-time speech pipeline.
+        """
+        if self.tool_manager is None:
+            return web.json_response(
+                {
+                    "augmented_prompt": "",
+                    "tools_used": [],
+                    "context": "",
+                    "needs_tools": False,
+                    "error": "Tool manager not initialised on this server.",
+                }
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": "Invalid JSON body."}, status=400
+            )
+
+        query: str = (body.get("query") or "").strip()
+        base_prompt: str = (body.get("base_prompt") or "").strip()
+
+        if not query:
+            return web.json_response(
+                {
+                    "augmented_prompt": base_prompt,
+                    "tools_used": [],
+                    "context": "",
+                    "needs_tools": False,
+                }
+            )
+
+        tool_names_detected = self.tool_manager.detect_tools(query)
+        needs_tools = bool(tool_names_detected)
+
+        if not needs_tools:
+            logger.info("augment-prompt: no tools needed for query %r", query[:80])
+            return web.json_response(
+                {
+                    "augmented_prompt": base_prompt,
+                    "tools_used": [],
+                    "context": "",
+                    "needs_tools": False,
+                }
+            )
+
+        logger.info(
+            "augment-prompt: tools=%s query=%r", tool_names_detected, query[:80]
+        )
+        augmented, results = await self.tool_manager.augment_prompt_async(
+            base_prompt, query
+        )
+        tools_used = [r.tool_name for r in results if r.success]
+        context_block = self.tool_manager.build_context_block(results)
+
+        return web.json_response(
+            {
+                "augmented_prompt": augmented,
+                "tools_used": tools_used,
+                "context": context_block,
+                "needs_tools": True,
+            }
+        )
 
     async def handle_chat(self, request):
         ws = web.WebSocketResponse()
@@ -409,6 +485,16 @@ def main():
 
     seed_all(42424242)
 
+    # ── Tool calling framework ────────────────────────────────────────────────
+    # All tools initialise gracefully — missing API keys are logged as warnings,
+    # not errors.  The server starts and runs normally even with no keys set;
+    # the DuckDuckGo fallback provides basic search coverage without any key.
+    tool_manager = ToolManager()
+    tool_manager.register(SearchTool())
+    tool_manager.register(CryptoTool())
+    tool_manager.register(FinanceTool())
+    logger.info("tool manager ready — tools: %s", tool_manager.list_tools())
+
     setup_tunnel = None
     tunnel_token = ''
     if args.gradio_tunnel:
@@ -453,11 +539,13 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        tool_manager=tool_manager,
     )
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_post("/api/augment-prompt", state.handle_augment_prompt)
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))
